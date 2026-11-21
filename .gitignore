@@ -1,0 +1,20 @@
+# Local keys and configuration
+/pki/
+/certs/
+/keys/
+/phone-private/
+/benchmarks/
+/reviews/
+.env
+.env.*
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# Build output
+/twinsail
+/twinsail.exe
+/bin/
+*.test
