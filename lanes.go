@@ -149,7 +149,7 @@ func serveGroup(g *laneGroup, c net.Conn, err error) {
 	uploadDone := make(chan struct{})
 	writer := newDrainingWriter(c)
 	go func() {
-		_, e := io.Copy(writer, g.streams[0])
+		e := copyRelayPayload(writer, g.streams[0])
 		if t, ok := c.(*net.TCPConn); ok {
 			t.CloseWrite()
 		}

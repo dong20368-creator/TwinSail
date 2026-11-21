@@ -109,7 +109,7 @@ func bridge(s *quic.Stream, c net.Conn, fromTCP io.Reader, awaitReply bool) {
 	done := make(chan struct{})
 	writer := newDrainingWriter(s)
 	go func() {
-		_, e := io.Copy(writer, fromTCP)
+		e := copyRelayPayload(writer, fromTCP)
 		if e != nil {
 			s.CancelWrite(1)
 		} else {
@@ -128,7 +128,7 @@ func bridge(s *quic.Stream, c net.Conn, fromTCP io.Reader, awaitReply bool) {
 		}
 		s.SetReadDeadline(time.Time{})
 	}
-	_, err := io.Copy(c, s)
+	err := copyRelayPayload(c, s)
 	if t, ok := c.(*net.TCPConn); ok {
 		_ = t.CloseWrite()
 	}
@@ -182,6 +182,7 @@ func acceptStream(s *quic.Stream, dial targetDialer) {
 
 type client struct {
 	unavailable atomic.Bool
+	suspect     atomic.Bool
 	uploadMbps  int
 	lanes       []*client
 	mu          sync.Mutex
@@ -223,7 +224,7 @@ func (p *client) startConnect() (*quic.Conn, *sessionDial) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		cfg := transport.Clone()
-		cfg.KeepAlivePeriod = 3 * time.Second
+		cfg.KeepAlivePeriod = clientKeepalive
 		c, err := quic.DialAddr(ctx, p.address, p.tls, cfg)
 		if err == nil {
 			if p.uploadMbps > 0 {
@@ -262,6 +263,7 @@ func (p *client) connect(ctx context.Context) (*quic.Conn, error) {
 // only the handshakes; the destination and application bytes are sent once.
 func (p *client) readyLanes(ctx context.Context) []*client {
 	var ready []*client
+	var fallback *client
 	type warmingLane struct {
 		lane *client
 		dial *sessionDial
@@ -272,13 +274,25 @@ func (p *client) readyLanes(ctx context.Context) []*client {
 			continue
 		}
 		if c, d := lane.startConnect(); c != nil {
+			if lane.suspect.Load() {
+				if fallback == nil {
+					fallback = lane
+				}
+				continue
+			}
 			ready = append(ready, lane)
 		} else {
 			warming = append(warming, warmingLane{lane, d})
 		}
 	}
-	if len(ready) > 0 || len(warming) == 0 {
+	if len(ready) > 0 {
 		return ready
+	}
+	if fallback != nil {
+		return []*client{fallback}
+	}
+	if len(warming) == 0 {
+		return nil
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -468,13 +482,24 @@ func listenRelay(addr string, cfg *tls.Config) (*quic.Listener, error) {
 	return listener, e
 }
 
-// Native QUIC keepalives elicit ACKs even on an idle tunnel. Retire only a
-// stalled session, then use a fresh UDP flow to test its replacement. No
-// application bytes are replayed onto the surviving lane.
+const clientKeepalive = 3 * time.Second
+
+// An idle quic-go connection schedules a PING after at least 1.5 PTO.
+// Allow time for a response and a retry before steering new tunnels away.
+// Both endpoints use the library's default maximum ACK delay (25ms plus
+// 1ms timer granularity). No extra probe traffic is required.
+func pathTimeouts(stats quic.ConnectionStats) (response, avoid, retire time.Duration) {
+	pto := stats.SmoothedRTT + max(4*stats.MeanDeviation, time.Millisecond) + 26*time.Millisecond
+	response = max(2*time.Second, 2*pto)
+	avoid = max(clientKeepalive, 3*pto/2) + response
+	retire = max(10*time.Second, avoid+response)
+	return
+}
+
 func (p *client) watchPath(ctx context.Context) {
 	var previous *quic.Conn
-	var received uint64
-	var lastProgress time.Time
+	var received, sentAtProgress uint64
+	var lastProgress, firstSend time.Time
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -485,13 +510,26 @@ func (p *client) watchPath(ctx context.Context) {
 		if err != nil {
 			p.unavailable.Store(true)
 		} else {
-			count := c.ConnectionStats().PacketsReceived
-			if previous != c || count != received {
-				previous, received, lastProgress = c, count, now
+			stats := c.ConnectionStats()
+			if previous != c || stats.PacketsReceived != received {
+				previous, received, lastProgress = c, stats.PacketsReceived, now
+				sentAtProgress = stats.PacketsSent
+				firstSend = time.Time{}
+				p.suspect.Store(false)
 				p.unavailable.Store(false)
-			} else if now.Sub(lastProgress) >= 10*time.Second {
-				p.unavailable.Store(true)
-				_ = c.CloseWithError(0, "path unresponsive")
+			} else if stats.PacketsSent != sentAtProgress {
+				if firstSend.IsZero() {
+					firstSend = now
+				}
+				response, avoid, retire := pathTimeouts(stats)
+				silence := now.Sub(lastProgress)
+				if silence >= avoid && now.Sub(firstSend) >= response {
+					p.suspect.Store(true)
+					if silence >= retire {
+						p.unavailable.Store(true)
+						_ = c.CloseWithError(0, "path unresponsive")
+					}
+				}
 			}
 		}
 		select {

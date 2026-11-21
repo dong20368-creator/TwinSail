@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,10 +20,12 @@ import (
 
 // Keep tunnels live while opening additional ones. Reading an echo exercises
 // both relay directions; a local CONNECT 200 alone does not establish delivery.
-func TestConcurrentTunnels(t *testing.T) { exerciseTunnels(t, false) }
-func TestLaneBlackhole(t *testing.T)     { exerciseTunnels(t, true) }
+func TestConcurrentTunnels(t *testing.T) { exerciseTunnels(t, "healthy") }
+func TestLaneBlackhole(t *testing.T)     { exerciseTunnels(t, "persistent loss") }
+func TestBriefLaneLoss(t *testing.T)     { exerciseTunnels(t, "brief loss") }
 
-func exerciseTunnels(t *testing.T, fault bool) {
+func exerciseTunnels(t *testing.T, scenario string) {
+	fault := scenario != "healthy"
 	origin, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -133,6 +136,58 @@ func exerciseTunnels(t *testing.T, fault bool) {
 			go lane.watchPath(ctx)
 		}
 		active := open(1)
+		if scenario == "brief loss" {
+			defer active.Close()
+			defer cancel()
+			original := p.lanes[1].currentSession()
+			// Wait through multiple idle keepalives. Both lanes should remain
+			// available without any application traffic.
+			for until := time.Now().Add(7500 * time.Millisecond); time.Now().Before(until); {
+				if len(p.readyLanes(ctx)) != 2 {
+					t.Fatal("healthy idle lane was excluded")
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			dropped.Store(true)
+			start := time.Now()
+			for {
+				lanes := p.readyLanes(ctx)
+				if len(lanes) == 1 && lanes[0] == p.lanes[0] {
+					break
+				}
+				if time.Since(start) > 8500*time.Millisecond {
+					t.Fatal("new requests still select the stalled lane before hard retirement")
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			open(2).Close()
+			t.Logf("fresh tunnel echoed on the healthy lane after %s", time.Since(start))
+			if p.lanes[1].currentSession() != original {
+				t.Fatal("temporary loss closed the existing session")
+			}
+			dropped.Store(false)
+			start = time.Now()
+			active.SetDeadline(start.Add(6 * time.Second))
+			payload := bytes.Repeat([]byte("striped-recovery"), 12288)
+			if _, e := active.Write(payload); e != nil {
+				t.Fatal(e)
+			}
+			echo := make([]byte, len(payload))
+			if _, e := io.ReadFull(active, echo); e != nil || !bytes.Equal(echo, payload) {
+				t.Fatalf("existing tunnel did not recover intact: %v", e)
+			}
+			for len(p.readyLanes(ctx)) != 2 {
+				if time.Since(start) > 6*time.Second {
+					t.Fatal("restored lane was not selected again")
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if p.lanes[1].currentSession() != original {
+				t.Fatal("restored lane reconnected instead of retaining the session")
+			}
+			t.Logf("original striped tunnel delivered %d bytes and both lanes rejoined after %s", len(echo), time.Since(start))
+			return
+		}
 		dropped.Store(true)
 		active.SetDeadline(time.Now().Add(time.Second))
 		payload := make([]byte, 192*1024)

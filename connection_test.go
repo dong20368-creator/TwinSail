@@ -64,6 +64,19 @@ func TestColdStartUsesFirstConnectedLane(t *testing.T) {
 	if got := handshakes.Load(); got != 1 {
 		t.Fatalf("%d TLS handshakes for %d callers, want one", got, callers)
 	}
+	healthy.suspect.Store(true)
+	if lanes := p.readyLanes(ctx); len(lanes) != 1 || lanes[0] != healthy {
+		t.Fatal("a temporarily suspect session must remain usable when it is the only choice")
+	}
+}
+
+func TestPathTimeoutsAllowForSlowIdlePings(t *testing.T) {
+	response, avoid, retire := pathTimeouts(quic.ConnectionStats{SmoothedRTT: 2 * time.Second, MeanDeviation: 400 * time.Millisecond})
+	// Native QUIC first waits at least 1.5 PTO (~5.4s) to send an idle
+	// ping on this path. Even a return near the next PTO is still healthy.
+	if response < 7*time.Second || avoid < 12*time.Second || retire < avoid+response {
+		t.Fatalf("insufficient slow-path windows: response %v, avoid %v, retire %v", response, avoid, retire)
+	}
 }
 
 func TestCanceledWaiterLeavesSharedHandshake(t *testing.T) {
